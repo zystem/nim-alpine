@@ -1,0 +1,134 @@
+name: build
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, versions.txt, .github/workflows/build.yml]
+  schedule:
+    - cron: "17 4 * * *"            # a new Nim version, or an image that was removed
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "build this version (x.y.z) even if it is published"
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: build
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nim
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: plan
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          image=$(echo "$IMAGE" | tr 'A-Z' 'a-z')
+          listed=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' versions.txt || true)
+          stable=$(curl -fsSL https://nim-lang.org/channels/stable | tr -d '[:space:]')
+          [[ "$stable" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "the stable channel says '$stable'"; exit 1; }
+          out=()
+          if [ -n "$INPUT_VERSION" ]; then
+            [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a version: $INPUT_VERSION"; exit 1; }
+            out+=("$INPUT_VERSION")
+          elif [ "$EVENT" = push ]; then
+            for v in $listed; do out+=("$v"); done            # the recipe changed: everything again
+          else
+            for v in $listed $stable; do
+              docker manifest inspect "$image:$v-alpine" >/dev/null 2>&1 || out+=("$v")
+            done
+          fi
+          json=$(printf '%s\n' "${out[@]:-}" | grep -E '^[0-9]' | sort -uV | python3 -c 'import sys,json;print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          echo "to build: $json"
+          echo "versions=$json" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: src
+        env:
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          sha=$(curl -fsSL "https://nim-lang.org/download/nim-${VERSION}.tar.xz.sha256" | cut -d' ' -f1)
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "no digest of nim-${VERSION}.tar.xz"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "image=$(echo "$IMAGE" | tr 'A-Z' 'a-z')" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            NIM_VERSION=${{ matrix.version }}
+            NIM_SHA256=${{ steps.src.outputs.sha }}
+          tags: ${{ steps.src.outputs.image }}:${{ matrix.version }}-alpine
+      - name: smoke test of what was published
+        env:
+          REF: ${{ steps.src.outputs.image }}:${{ matrix.version }}-alpine
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$REF" sh -c '
+            test "$(nim --version | head -1)" = "Nim Compiler Version '"$VERSION"' [Linux: amd64]"
+            echo "echo \"static ok\"" > /tmp/h.nim
+            nim c -r --hints:off -d:release --passL:-static -o:/tmp/h /tmp/h.nim
+            printf "import std/[httpclient, net]\nlet c = newHttpClient(sslContext = newContext(verifyMode = CVerifyNone))\necho c != nil\n" > /tmp/s.nim
+            nim c -r --hints:off --warnings:off -d:ssl -o:/tmp/s /tmp/s.nim
+            nimble --version | head -1'
+          docker image inspect "$REF" --format 'size: {{.Size}} bytes'
+
+  official:
+    # an official Alpine image of a version we build: say so once, so that the recipe can be dropped
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for v in $(echo '${{ needs.plan.outputs.versions }}' | python3 -c 'import sys,json;print(" ".join(json.load(sys.stdin)))'); do
+            n=$(curl -fsSL "https://hub.docker.com/v2/repositories/nimlang/nim/tags?page_size=5&name=$v-alpine" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["results"]))')
+            if [ "$n" -gt 0 ]; then
+              title="nimlang/nim:$v-alpine exists: use it"
+              if [ -z "$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "$title in:title" --json number --jq '.[0].number')" ]; then
+                gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "The official image nimlang/nim:$v-alpine is published, so this recipe is not needed for $v."
+              fi
+            fi
+          done

@@ -1,0 +1,3 @@
+# The Nim versions to keep built, one per line. A change here (or in the Dockerfile) rebuilds all of them; the daily run builds the ones that are not published yet,
+# and the version that nim-lang.org calls stable is built without being listed.
+2.2.12
