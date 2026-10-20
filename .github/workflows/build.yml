@@ -54,7 +54,7 @@ jobs:
               docker manifest inspect "$image:$v-alpine" >/dev/null 2>&1 || out+=("$v")
             done
           fi
-          json=$(printf '%s\n' "${out[@]:-}" | grep -E '^[0-9]' | sort -uV | python3 -c 'import sys,json;print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          json=$(printf '%s\n' "${out[@]:-}" | { grep -E '^[0-9]' || true; } | sort -uV | python3 -c 'import sys,json;print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           echo "to build: $json"
           echo "versions=$json" >> "$GITHUB_OUTPUT"
 
